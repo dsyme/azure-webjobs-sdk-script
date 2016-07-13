@@ -3,9 +3,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Formatting;
 using System.Net.Http.Headers;
 using System.Reflection.Emit;
 using System.Threading.Tasks;
@@ -17,35 +20,34 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
 {
     public class HttpBinding : FunctionBinding, IResultProcessingBinding
     {
-        internal const string HttpResponsePropertyKey = "MS_AzureFunctionsHttpResponse";
-
-        public HttpBinding(ScriptHostConfiguration config, string name, FileAccess access, bool isTrigger) : base(config, name, BindingType.Http, access, isTrigger)
+        public HttpBinding(ScriptHostConfiguration config, BindingMetadata metadata, FileAccess access) : 
+            base(config, metadata, access)
         {
         }
 
-        public override bool HasBindingParameters
-        {
-            get
-            {
-                return false;
-            }
-        }
-
-        public override CustomAttributeBuilder GetCustomAttribute()
+        public override Collection<CustomAttributeBuilder> GetCustomAttributes(Type parameterType)
         {
             return null;
         }
 
         public override async Task BindAsync(BindingContext context)
         {
-            HttpRequestMessage request = (HttpRequestMessage)context.Input;
+            HttpRequestMessage request = (HttpRequestMessage)context.TriggerValue;
 
-            string content;
-            using (StreamReader streamReader = new StreamReader(context.Value))
+            // TODO: Find a better place for this code
+            string content = string.Empty;
+            if (context.Value is Stream)
             {
-                content = await streamReader.ReadToEndAsync();
+                using (StreamReader streamReader = new StreamReader((Stream)context.Value))
+                {
+                    content = await streamReader.ReadToEndAsync();
+                }
             }
-
+            else if (context.Value is string)
+            {
+                content = (string)context.Value;
+            }
+            
             HttpResponseMessage response = null;
             try
             {
@@ -68,6 +70,17 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
                     response = new HttpResponseMessage(statusCode);
                     response.Content = new StringContent(body);
 
+                    // we default the Content-Type here, but we override below with any
+                    // Content-Type header the user might have set themselves
+                    // TODO: rather than newing up an HttpResponseMessage investigate using
+                    // request.CreateResponse, which should allow WebApi Content negotiation to
+                    // take place.
+                    if (Utility.IsJson(body))
+                    {
+                        response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                    }
+
+                    // apply any user specified headers
                     JObject headers = (JObject)jsonObject["headers"];
                     if (headers != null)
                     {
@@ -94,22 +107,45 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
                 };
             }
 
-            request.Properties[HttpResponsePropertyKey] = response;
+            request.Properties[ScriptConstants.AzureFunctionsHttpResponseKey] = response;
         }
-
-        public void ProcessResult(object inputValue, object result)
+        
+        public void ProcessResult(IDictionary<string, object> functionArguments, object[] systemArguments, string triggerInputName, object result)
         {
-            HttpRequestMessage request = inputValue as HttpRequestMessage;
-
-            if (request != null && result is HttpResponseMessage)
+            if (result == null)
             {
-                request.Properties[HttpResponsePropertyKey] = result;
+                return;
+            }
+
+            HttpRequestMessage request = null;
+            object argValue = null;
+            if (functionArguments.TryGetValue(triggerInputName, out argValue) && argValue is HttpRequestMessage)
+            {
+                request = (HttpRequestMessage)argValue;
+            }
+            else
+            {
+                // No argument is bound to the request message, so we should have 
+                // it in the system arguments
+                request = systemArguments.FirstOrDefault(a => a is HttpRequestMessage) as HttpRequestMessage;
+            }
+
+            if (request != null)
+            {
+                HttpResponseMessage response = result as HttpResponseMessage;
+                if (response == null)
+                {
+                    response = request.CreateResponse(HttpStatusCode.OK);
+                    response.Content = new ObjectContent(result.GetType(), result, new JsonMediaTypeFormatter());
+                }
+
+                request.Properties[ScriptConstants.AzureFunctionsHttpResponseKey] = response;
             }
         }
 
         public bool CanProcessResult(object result)
         {
-            return result is HttpResponseMessage;
+            return result != null;
         }
 
         private static void AddResponseHeader(HttpResponseMessage response, KeyValuePair<string, JToken> header)

@@ -2,13 +2,15 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Reflection.Emit;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host.Bindings.Path;
 using Microsoft.Azure.WebJobs.Script.Description;
-using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Table;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -20,50 +22,49 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
     {
         private readonly BindingTemplate _partitionKeyBindingTemplate;
         private readonly BindingTemplate _rowKeyBindingTemplate;
-        private readonly TableQuery _tableQuery;
+        private readonly BindingTemplate _filterBindingTemplate;
 
-        public TableBinding(ScriptHostConfiguration config, string name, string tableName, string partitionKey, string rowKey, FileAccess access, TableQuery tableQuery = null) 
-            : base(config, name, BindingType.Table, access, false)
+        public TableBinding(ScriptHostConfiguration config, TableBindingMetadata metadata, FileAccess access) 
+            : base(config, metadata, access)
         {
-            if (string.IsNullOrEmpty(tableName))
+            if (string.IsNullOrEmpty(metadata.TableName))
             {
                 throw new ArgumentException("The table name cannot be null or empty.");
             }
 
-            TableName = tableName;
-            PartitionKey = partitionKey;
-            RowKey = rowKey;
-            _partitionKeyBindingTemplate = BindingTemplate.FromString(PartitionKey);
+            TableName = metadata.TableName;
+
+            PartitionKey = metadata.PartitionKey;
+            if (!string.IsNullOrEmpty(PartitionKey))
+            {
+                _partitionKeyBindingTemplate = BindingTemplate.FromString(PartitionKey);
+            }
+
+            RowKey = metadata.RowKey;
             if (!string.IsNullOrEmpty(RowKey))
             {
                 _rowKeyBindingTemplate = BindingTemplate.FromString(RowKey);
             }
 
-            _tableQuery = tableQuery;
-            if (_tableQuery == null)
+            Filter = metadata.Filter;
+            if (!string.IsNullOrEmpty(Filter))
             {
-                _tableQuery = new TableQuery
-                {
-                    TakeCount = 50
-                };
+                _filterBindingTemplate = BindingTemplate.FromString(Filter);
             }
+
+            Take = metadata.Take ?? 50;
         }
 
         public string TableName { get; private set; }
         public string PartitionKey { get; private set; }
         public string RowKey { get; private set; }
+        public int Take { get; private set; }
+        public string Filter { get; private set; }
 
-        public override bool HasBindingParameters
+        public override Collection<CustomAttributeBuilder> GetCustomAttributes(Type parameterType)
         {
-            get
-            {
-                return _partitionKeyBindingTemplate.ParameterNames.Any() ||
-                       (_rowKeyBindingTemplate != null && _rowKeyBindingTemplate.ParameterNames.Any());
-            }
-        }
+            Collection<CustomAttributeBuilder> attributes = new Collection<CustomAttributeBuilder>();
 
-        public override CustomAttributeBuilder GetCustomAttribute()
-        {
             Type[] constructorTypes = null;
             object[] constructorArguments = null;
             if (Access == FileAccess.Write)
@@ -73,102 +74,212 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
             }
             else
             {
-                constructorTypes = new Type[] { typeof(string), typeof(string), typeof(string) };
-                constructorArguments = new object[] { TableName, PartitionKey, RowKey };
+                if (!string.IsNullOrEmpty(PartitionKey) && !string.IsNullOrEmpty(RowKey))
+                {
+                    constructorTypes = new Type[] { typeof(string), typeof(string), typeof(string) };
+                    constructorArguments = new object[] { TableName, PartitionKey, RowKey };
+                }
+                else
+                {
+                    constructorTypes = new Type[] { typeof(string) };
+                    constructorArguments = new object[] { TableName };
+                }
             }
 
-            return new CustomAttributeBuilder(typeof(TableAttribute).GetConstructor(constructorTypes), constructorArguments);
+            attributes.Add(new CustomAttributeBuilder(typeof(TableAttribute).GetConstructor(constructorTypes), constructorArguments));
+
+            if (!string.IsNullOrEmpty(Metadata.Connection))
+            {
+                AddStorageAccountAttribute(attributes, Metadata.Connection);
+            }
+
+            return attributes;
         }
 
         public override async Task BindAsync(BindingContext context)
         {
             string boundPartitionKey = PartitionKey;
             string boundRowKey = RowKey;
+            string boundFilter = Filter;
+
+            IReadOnlyDictionary<string, string> bindingData = null;
             if (context.BindingData != null)
             {
-                boundPartitionKey = _partitionKeyBindingTemplate.Bind(context.BindingData);
+                bindingData = context.BindingData.ToStringValues();
+            }
+
+            if (context.BindingData != null)
+            {
+                if (_partitionKeyBindingTemplate != null)
+                {
+                    boundPartitionKey = _partitionKeyBindingTemplate.Bind(bindingData);
+                }
+                
                 if (_rowKeyBindingTemplate != null)
                 {
-                    boundRowKey = _rowKeyBindingTemplate.Bind(context.BindingData);
+                    boundRowKey = _rowKeyBindingTemplate.Bind(bindingData);
+                }
+
+                if (_filterBindingTemplate != null)
+                {
+                    boundFilter = _filterBindingTemplate.Bind(bindingData);
                 }
             }
 
-            boundPartitionKey = Resolve(boundPartitionKey);
+            if (!string.IsNullOrEmpty(boundPartitionKey))
+            {
+                boundPartitionKey = Resolve(boundPartitionKey);
+            }
+
             if (!string.IsNullOrEmpty(boundRowKey))
             {
                 boundRowKey = Resolve(boundRowKey);
             }
 
-            // TODO: Need to handle Stream conversions properly
-            Stream valueStream = context.Value as Stream;
+            if (!string.IsNullOrEmpty(boundFilter))
+            {
+                boundFilter = Resolve(boundFilter);
+            }
+
+            Collection<Attribute> attributes = new Collection<Attribute>();
+            if (!string.IsNullOrEmpty(Metadata.Connection))
+            {
+                attributes.Add(new StorageAccountAttribute(Metadata.Connection));
+            }
 
             if (Access == FileAccess.Write)
             {
-                // read the content as a JObject
-                JObject jsonObject = null;
-                using (StreamReader streamReader = new StreamReader(valueStream))
+                attributes.Insert(0, new TableAttribute(TableName));
+                IAsyncCollector<DynamicTableEntity> collector = await context.Binder.BindAsync<IAsyncCollector<DynamicTableEntity>>(attributes.ToArray());
+                ICollection entities = ReadAsCollection(context.Value);
+
+                foreach (JObject entity in entities)
                 {
-                    string content = await streamReader.ReadToEndAsync();
-                    jsonObject = JObject.Parse(content);
+                    // Here we're mapping from JObject to DynamicTableEntity because the Table binding doesn't support
+                    // a JObject binding. We enable that for the core Table binding in the future, which would allow
+                    // this code to go away.
+                    DynamicTableEntity tableEntity = CreateTableEntityFromJObject(boundPartitionKey, boundRowKey, entity);
+                    await collector.AddAsync(tableEntity);
                 }
-
-                // TODO: If RowKey has not been specified in the binding, try to
-                // derive from the object properties (e.g. "rowKey" or "id" properties);
-
-                IAsyncCollector<DynamicTableEntity> collector = context.Binder.Bind<IAsyncCollector<DynamicTableEntity>>(new TableAttribute(TableName));
-                DynamicTableEntity tableEntity = new DynamicTableEntity(boundPartitionKey, boundRowKey);
-                foreach (JProperty property in jsonObject.Properties())
-                {
-                    EntityProperty entityProperty = EntityProperty.CreateEntityPropertyFromObject((object)property.Value);
-                    tableEntity.Properties.Add(property.Name, entityProperty);
-                }
-
-                await collector.AddAsync(tableEntity);
             }
             else
             {
+                string json = null;
                 if (!string.IsNullOrEmpty(boundPartitionKey) &&
                     !string.IsNullOrEmpty(boundRowKey))
                 {
                     // singleton
-                    DynamicTableEntity tableEntity = context.Binder.Bind<DynamicTableEntity>(new TableAttribute(TableName, boundPartitionKey, boundRowKey));
+                    attributes.Insert(0, new TableAttribute(TableName, boundPartitionKey, boundRowKey));
+                    DynamicTableEntity tableEntity = await context.Binder.BindAsync<DynamicTableEntity>(attributes.ToArray());
                     if (tableEntity != null)
                     {
-                        string json = ConvertEntityToJObject(tableEntity).ToString();
-                        using (StreamWriter sw = new StreamWriter(valueStream))
-                        {
-                            await sw.WriteAsync(json);
-                        }
+                        json = ConvertEntityToJObject(tableEntity).ToString();
                     }
                 }
                 else
                 {
-                    // binding to entire table (query multiple table entities)
-                    CloudTable table = context.Binder.Bind<CloudTable>(new TableAttribute(TableName, boundPartitionKey, boundRowKey));
-                    var entities = table.ExecuteQuery(_tableQuery);
+                    // binding to multiple table entities
+                    attributes.Insert(0, new TableAttribute(TableName));
+                    CloudTable table = await context.Binder.BindAsync<CloudTable>(attributes.ToArray());
 
+                    string finalQuery = boundFilter;
+                    if (!string.IsNullOrEmpty(boundPartitionKey))
+                    {
+                        var partitionKeyPredicate = TableQuery.GenerateFilterCondition("PartitionKey", QueryComparisons.Equal, boundPartitionKey);
+                        if (!string.IsNullOrEmpty(boundFilter))
+                        {
+                            finalQuery = TableQuery.CombineFilters(boundFilter, TableOperators.And, partitionKeyPredicate);
+                        }
+                        else
+                        {
+                            finalQuery = partitionKeyPredicate;
+                        }
+                    }
+
+                    TableQuery tableQuery = new TableQuery
+                    {
+                        TakeCount = Take,
+                        FilterString = finalQuery
+                    };
+
+                    var entities = table.ExecuteQuery(tableQuery);
                     JArray entityArray = new JArray();
                     foreach (var entity in entities)
                     {
                         entityArray.Add(ConvertEntityToJObject(entity));
                     }
 
-                    string json = entityArray.ToString(Formatting.None);
-                    using (StreamWriter sw = new StreamWriter(valueStream))
+                    json = entityArray.ToString(Formatting.None);
+                }
+
+                if (json != null)
+                {
+                    if (context.DataType == DataType.Stream)
                     {
+                        // We're explicitly NOT disposing the StreamWriter because
+                        // we don't want to close the underlying Stream
+                        StreamWriter sw = new StreamWriter((Stream)context.Value);
                         await sw.WriteAsync(json);
+                        sw.Flush();
+                    }
+                    else
+                    {
+                        context.Value = json;
                     }
                 }
             }
         }
 
+        private DynamicTableEntity CreateTableEntityFromJObject(string partitionKey, string rowKey, JObject entity)
+        {
+            // any key values specified on the entity override any values
+            // specified in the binding
+            JToken keyValue = null;
+            if (entity.TryGetValue("partitionKey", StringComparison.OrdinalIgnoreCase, out keyValue))
+            {
+                partitionKey = Resolve((string)keyValue);
+                entity.Remove("partitionKey");
+            }
+
+            if (entity.TryGetValue("rowKey", StringComparison.OrdinalIgnoreCase, out keyValue))
+            {
+                rowKey = Resolve((string)keyValue);
+                entity.Remove("rowKey");
+            }
+
+            DynamicTableEntity tableEntity = new DynamicTableEntity(partitionKey, rowKey);
+            foreach (JProperty property in entity.Properties())
+            {
+                EntityProperty entityProperty = CreateEntityPropertyFromJProperty(property);
+                tableEntity.Properties.Add(property.Name, entityProperty);
+            }
+
+            return tableEntity;
+        }
+
+        private static EntityProperty CreateEntityPropertyFromJProperty(JProperty property)
+        {
+            switch (property.Value.Type)
+            {
+                case JTokenType.String:
+                    return EntityProperty.GeneratePropertyForString((string)property.Value);
+                case JTokenType.Integer:
+                    return EntityProperty.GeneratePropertyForInt((int)property.Value);
+                case JTokenType.Boolean:
+                    return EntityProperty.GeneratePropertyForBool((bool)property.Value);
+                case JTokenType.Guid:
+                    return EntityProperty.GeneratePropertyForGuid((Guid)property.Value);
+                case JTokenType.Float:
+                    return EntityProperty.GeneratePropertyForDouble((double)property.Value);
+                default:
+                    return EntityProperty.CreateEntityPropertyFromObject((object)property.Value);
+            }
+        }
+
         private static JObject ConvertEntityToJObject(DynamicTableEntity tableEntity)
         {
-            OperationContext context = new OperationContext();
-            var entityProperties = tableEntity.WriteEntity(context);
-
             JObject jsonObject = new JObject();
-            foreach (var entityProperty in entityProperties)
+            foreach (var entityProperty in tableEntity.Properties)
             {
                 JValue value = null;
                 switch (entityProperty.Value.PropertyType)
@@ -201,6 +312,10 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
 
                 jsonObject.Add(entityProperty.Key, value);
             }
+
+            jsonObject.Add("PartitionKey", tableEntity.PartitionKey);
+            jsonObject.Add("RowKey", tableEntity.RowKey);
+
             return jsonObject;
         }
     }

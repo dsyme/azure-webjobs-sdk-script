@@ -2,17 +2,16 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Web;
-using System.Web.Hosting;
 using System.Web.Http;
 using Autofac;
 using Autofac.Integration.WebApi;
-using WebJobs.Script.WebHost.App_Start;
-using WebJobs.Script.WebHost.Controllers;
-using WebJobs.Script.WebHost.Handlers;
+using Microsoft.Azure.WebJobs.Script.WebHost.Controllers;
+using Microsoft.Azure.WebJobs.Script.WebHost.Handlers;
 
-namespace WebJobs.Script.WebHost
+namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public static class WebApiConfig
     {
@@ -31,6 +30,16 @@ namespace WebJobs.Script.WebHost
             {
                 throw new ArgumentNullException("settings");
             }
+
+            // Delete hostingstart.html if any. Azure creates that in all sites by default
+            string hostingStart = Path.Combine(settings.ScriptPath, "hostingstart.html");
+            if (File.Exists(hostingStart))
+            {
+                File.Delete(hostingStart);
+            }
+
+            // Add necessary folders to the %PATH%
+            PrependFoldersToEnvironmentPath();
 
             var builder = new ContainerBuilder();
             builder.RegisterApiControllers(typeof(FunctionsController).Assembly);
@@ -72,6 +81,32 @@ namespace WebJobs.Script.WebHost
             config.InitializeReceiveSalesforceWebHooks();
         }
 
+        private static void PrependFoldersToEnvironmentPath()
+        {
+            // Only do this when %HOME% is defined (normally on Azure)
+            string home = Environment.GetEnvironmentVariable("HOME");
+            if (!string.IsNullOrEmpty(home))
+            {
+                // Create the tools folder if it doesn't exist
+                string toolsPath = Path.Combine(home, @"site\tools");
+                Directory.CreateDirectory(toolsPath);
+
+                var folders = new List<string>();
+                folders.Add(Path.Combine(home, @"site\tools"));
+
+                string path = Environment.GetEnvironmentVariable("PATH");
+                string additionalPaths = String.Join(";", folders);
+
+                // Make sure we haven't already added them. This can happen if the appdomain restart (since it's still same process)
+                if (!path.Contains(additionalPaths))
+                {
+                    path = additionalPaths + ";" + path;
+
+                    Environment.SetEnvironmentVariable("PATH", path);
+                }
+            }
+        }
+
         private static WebHostSettings GetDefaultSettings()
         {
             WebHostSettings settings = new WebHostSettings();
@@ -80,7 +115,7 @@ namespace WebJobs.Script.WebHost
             bool isLocal = string.IsNullOrEmpty(home);
             if (isLocal)
             {
-                settings.ScriptPath = Path.Combine(HostingEnvironment.ApplicationPhysicalPath, @"..\..\sample");
+                settings.ScriptPath = Environment.GetEnvironmentVariable("AzureWebJobsScriptRoot");
                 settings.LogPath = Path.Combine(Path.GetTempPath(), @"Functions");
                 settings.SecretsPath = HttpContext.Current.Server.MapPath("~/App_Data/Secrets");
             }
@@ -90,6 +125,11 @@ namespace WebJobs.Script.WebHost
                 settings.ScriptPath = Path.Combine(home, @"site\wwwroot");
                 settings.LogPath = Path.Combine(home, @"LogFiles\Application\Functions");
                 settings.SecretsPath = Path.Combine(home, @"data\Functions\secrets");
+            }
+
+            if (string.IsNullOrEmpty(settings.ScriptPath))
+            {
+                throw new InvalidOperationException("Unable to determine function script root directory.");
             }
 
             return settings;

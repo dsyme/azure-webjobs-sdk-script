@@ -1,15 +1,16 @@
 {
-  "bindings": [
-    {
-      "type": "queueTrigger",
-      "direction": "in",
-      "queueName": "test-input"
-    },
-    {
-      "type": "blob",
-      "name": "output",
-      "direction": "out",
-      "path": "test-output/{id}"
-    }
-  ]
+    "bindings": [
+        {
+            "type": "queueTrigger",
+            "name": "input",
+            "direction": "in",
+            "queueName": "test-input-bash"
+        },
+        {
+            "type": "blob",
+            "name": "output",
+            "direction": "out",
+            "path": "test-output-bash/{id}"
+        }
+    ]
 }

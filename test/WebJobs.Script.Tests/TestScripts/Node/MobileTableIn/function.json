@@ -1,0 +1,23 @@
+﻿{
+    "bindings": [
+        {
+            "type": "queueTrigger",
+            "name": "input",
+            "queueName": "mobiletables-input",
+            "direction": "in"
+        },
+        {
+            "type": "mobileTable",
+            "name": "itemIn",
+            "direction": "in",
+            "tableName": "Item",
+            "id": "{recordId}"
+        },
+        {
+            "type": "mobileTable",
+            "direction": "out",
+            "name": "itemOut",
+            "tableName": "Item"
+        }
+    ]
+}

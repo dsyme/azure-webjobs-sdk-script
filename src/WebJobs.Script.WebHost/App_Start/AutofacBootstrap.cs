@@ -1,15 +1,13 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using System.Configuration;
+using System;
 using System.Threading.Tasks;
-using System.Web.Configuration;
 using System.Web.Hosting;
 using Autofac;
-using Microsoft.Azure.WebJobs.Script;
-using WebJobs.Script.WebHost.WebHooks;
+using Microsoft.Azure.WebJobs.Script.WebHost.WebHooks;
 
-namespace WebJobs.Script.WebHost.App_Start
+namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
     public static class AutofacBootstrap
     {
@@ -22,21 +20,30 @@ namespace WebJobs.Script.WebHost.App_Start
                 FileLoggingEnabled = true
             };
 
-            // If there is an explicit machine key, it makes a good default host id. It can still be
-            // overridden in host.json
-            var section = (MachineKeySection)ConfigurationManager.GetSection("system.web/machineKey");
-            if (section.Decryption != "Auto" && section.ValidationKey.Length >= 32)
+            // If running on Azure Web App, derive the host ID from the site name
+            string hostId = Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME");
+            if (!String.IsNullOrEmpty(hostId))
             {
-                scriptHostConfig.HostConfig.HostId = section.ValidationKey.Substring(0, 32).ToLowerInvariant();
-            }
+                // Truncate to the max host name length if needed
+                const int MaximumHostIdLength = 32;
+                if (hostId.Length > MaximumHostIdLength)
+                {
+                    hostId = hostId.Substring(0, MaximumHostIdLength);
+                }
 
-            WebScriptHostManager scriptHostManager = new WebScriptHostManager(scriptHostConfig);
-            builder.RegisterInstance<WebScriptHostManager>(scriptHostManager);
+                // Trim any trailing - as they can cause problems with queue names
+                hostId = hostId.TrimEnd('-');
+
+                scriptHostConfig.HostConfig.HostId = hostId.ToLowerInvariant();
+            }
 
             SecretManager secretManager = new SecretManager(settings.SecretsPath);
             // Make sure that host secrets get created on startup if they don't exist
             secretManager.GetHostSecrets();
             builder.RegisterInstance<SecretManager>(secretManager);
+
+            WebScriptHostManager scriptHostManager = new WebScriptHostManager(scriptHostConfig, secretManager);
+            builder.RegisterInstance<WebScriptHostManager>(scriptHostManager);
 
             WebHookReceiverManager webHookReceiverManager = new WebHookReceiverManager(secretManager);
             builder.RegisterInstance<WebHookReceiverManager>(webHookReceiverManager);

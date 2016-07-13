@@ -4,25 +4,31 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Net;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Script;
+using Microsoft.Azure.WebJobs.Script.Tests.ApiHub;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Newtonsoft.Json;
 using Xunit;
 
-namespace WebJobs.Script.Tests
+namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public class CSharpEndToEndTests : EndToEndTestsBase<CSharpEndToEndTests.TestFixture>
     {
-        private const string JobLogTestFileName = "joblog.txt";
-
         public CSharpEndToEndTests(TestFixture fixture) : base(fixture)
         {
         }
 
         [Fact]
-        public async Task EasyTables()
+        public async Task ServiceBusQueueTriggerToBlobTest()
         {
-            await EasyTablesTest();
+            await ServiceBusQueueTriggerToBlobTestImpl();
+        }
+
+        [Fact]
+        public async Task MobileTables()
+        {
+            await MobileTablesTest(isDotNet: true);
         }
 
         [Fact]
@@ -32,7 +38,25 @@ namespace WebJobs.Script.Tests
         }
 
         [Fact]
-        public async Task EasyTablesTable()
+        public async Task NotificationHub()
+        {
+            await NotificationHubTest("NotificationHubOut");
+        }
+
+        [Fact]
+        public async Task NotificationHub_Out_Notification()
+        {
+            await NotificationHubTest("NotificationHubOutNotification");
+        }
+
+        [Fact]
+        public async Task NotificationHubNative()
+        {
+            await NotificationHubTest("NotificationHubNative");
+        }
+
+        [Fact]
+        public async Task MobileTablesTable()
         {
             var id = Guid.NewGuid().ToString();
             Dictionary<string, object> arguments = new Dictionary<string, object>()
@@ -40,58 +64,182 @@ namespace WebJobs.Script.Tests
                 { "input",  id }
             };
 
-            await Fixture.TouchProjectJson("EasyTableTable");
+            await Fixture.Host.CallAsync("MobileTableTable", arguments);
 
-            await Fixture.Host.CallAsync("EasyTableTable", arguments);
+            await WaitForMobileTableRecordAsync("Item", id);
+        }
 
-            await WaitForEasyTableRecordAsync("Item", id);
+        [Fact]
+        public async Task ScriptReference_LoadsScript()
+        {
+            var request = new System.Net.Http.HttpRequestMessage();
+            Dictionary<string, object> arguments = new Dictionary<string, object>()
+            {
+                { "req", request }
+            };
+
+            await Fixture.Host.CallAsync("LoadScriptReference", arguments);
+
+            Assert.Equal("TestClass", request.Properties["LoadedScriptResponse"]);
+        }
+
+        [Fact]
+        public async Task ApiHub()
+        {
+            await ApiHubTest();
+        }
+
+        [Fact]
+        public async Task ApiHubTableClientBindingTest()
+        {
+            var textArgValue = ApiHubTestHelper.NewRandomString();
+
+            // Ensure the test entity exists.
+            await ApiHubTestHelper.EnsureEntityAsync(ApiHubTestHelper.EntityId1);
+
+            // Test table client binding.
+            await Fixture.Host.CallAsync("ApiHubTableClient", 
+                new Dictionary<string, object>()
+                {
+                    { ApiHubTestHelper.TextArg, textArgValue }
+                });
+
+            await ApiHubTestHelper.AssertTextUpdatedAsync(
+                textArgValue, ApiHubTestHelper.EntityId1);
+        }
+
+        [Fact]
+        public async Task ApiHubTableBindingTest()
+        {
+            var textArgValue = ApiHubTestHelper.NewRandomString();
+
+            // Ensure the test entity exists.
+            await ApiHubTestHelper.EnsureEntityAsync(ApiHubTestHelper.EntityId2);
+
+            // Test table binding.
+            TestInput input = new TestInput
+            {
+                Id = ApiHubTestHelper.EntityId2,
+                Value = textArgValue
+            };
+            await Fixture.Host.CallAsync("ApiHubTable",
+                new Dictionary<string, object>()
+                {
+                    { "input", JsonConvert.SerializeObject(input) }
+                });
+
+            await ApiHubTestHelper.AssertTextUpdatedAsync(
+                textArgValue, ApiHubTestHelper.EntityId2);
+        }
+
+        [Fact]
+        public async Task ApiHubTableEntityBindingTest()
+        {
+            var textArgValue = ApiHubTestHelper.NewRandomString();
+
+            // Ensure the test entity exists.
+            await ApiHubTestHelper.EnsureEntityAsync(ApiHubTestHelper.EntityId3);
+
+            // Test table entity binding.
+            TestInput input = new TestInput
+            {
+                Id = ApiHubTestHelper.EntityId3,
+                Value = textArgValue
+            };
+            await Fixture.Host.CallAsync("ApiHubTableEntity",
+                new Dictionary<string, object>()
+                {
+                    { "input", JsonConvert.SerializeObject(input) }
+                });
+
+            await ApiHubTestHelper.AssertTextUpdatedAsync(
+                textArgValue, ApiHubTestHelper.EntityId3);
+        }
+
+        [Fact]
+        public async Task SharedAssemblyDependenciesAreLoaded()
+        {
+            var request = new System.Net.Http.HttpRequestMessage();
+            Dictionary<string, object> arguments = new Dictionary<string, object>()
+            {
+                { "req", request }
+            };
+
+            await Fixture.Host.CallAsync("AssembliesFromSharedLocation", arguments);
+
+            Assert.Equal("secondary type value", request.Properties["DependencyOutput"]);
         }
 
         public class TestFixture : EndToEndTestFixture
         {
-            public TestFixture() : base(@"TestScripts\CSharp")
+            private const string ScriptRoot = @"TestScripts\CSharp";
+
+            static TestFixture()
             {
-                File.Delete(JobLogTestFileName);
-                DownloadNuget();
+                CreateSharedAssemblies();
             }
 
-            public async Task TouchProjectJson(string scriptFolderName)
+            public TestFixture() : base(ScriptRoot, "csharp")
             {
-                string scriptPath = Path.Combine(@"TestScripts\CSharp", scriptFolderName);
-                string projectLockJson = Path.Combine(scriptPath, "project.lock.json");
-                string projectJson = Path.Combine(scriptPath, "project.json");
-                if (File.Exists(projectLockJson))
+            }
+
+            private static void CreateSharedAssemblies()
+            {
+                string sharedAssembliesPath = Path.Combine(ScriptRoot, "SharedAssemblies");
+
+                if (Directory.Exists(sharedAssembliesPath))
                 {
-                    // If the file was already there, the host won't restart as nothing
-                    // has changed. Assume everything is good and exit.
-                    return;
+                    Directory.Delete(sharedAssembliesPath, true);
                 }
 
-                ScriptHost oldHost = Host;
-                File.SetLastWriteTimeUtc(projectJson, DateTime.UtcNow);
+                Directory.CreateDirectory(sharedAssembliesPath);
 
-                // Wait for the new host to start up.
-                await TestHelpers.Await(() =>
-                {
-                    return !Object.ReferenceEquals(oldHost, Host);
-                });
+                string secondaryDependencyPath = Path.Combine(sharedAssembliesPath, "SecondaryDependency.dll");
+
+                string primaryReferenceSource = @"
+using SecondaryDependency;
+
+namespace PrimaryDependency
+{
+    public class Primary
+    {
+        public string GetValue()
+        {
+            var secondary = new Secondary();
+            return secondary.GetSecondaryValue();
+        }
+    }
+}";
+                string secondaryReferenceSource = @"
+namespace SecondaryDependency
+{
+    public class Secondary
+    {
+        public string GetSecondaryValue()
+        {
+            return ""secondary type value"";
+        }
+    }
+}";
+                var secondarySyntaxTree = CSharpSyntaxTree.ParseText(secondaryReferenceSource);
+                Compilation secondaryCompilation = CSharpCompilation.Create("SecondaryDependency", new[] { secondarySyntaxTree })
+                    .WithReferences(MetadataReference.CreateFromFile(typeof(object).Assembly.Location))
+                    .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+                secondaryCompilation.Emit(secondaryDependencyPath);
+
+                var primarySyntaxTree = CSharpSyntaxTree.ParseText(primaryReferenceSource);
+                Compilation primaryCompilation = CSharpCompilation.Create("PrimaryDependency", new[] { primarySyntaxTree })
+                    .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary))
+                    .WithReferences(MetadataReference.CreateFromFile(secondaryDependencyPath), MetadataReference.CreateFromFile(typeof(object).Assembly.Location));
+                
+                primaryCompilation.Emit(Path.Combine(sharedAssembliesPath, "PrimaryDependency.dll"));
             }
+        }
 
-            private void DownloadNuget()
-            {
-                string fileName = @"Nuget\nuget.exe";
-                Directory.CreateDirectory("Nuget");
-
-                fileName = Path.GetFullPath(fileName);
-
-                if (!File.Exists(fileName))
-                {
-                    WebClient webClient = new WebClient();
-                    webClient.DownloadFile("https://dist.nuget.org/win-x86-commandline/latest/nuget.exe", fileName);
-                }
-
-                Environment.SetEnvironmentVariable("AzureWebJobs_NuGetPath", fileName);
-            }
+        public class TestInput
+        {
+            public int Id { get; set; }
+            public string Value { get; set; }
         }
     }
 }

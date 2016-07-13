@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
@@ -12,9 +13,10 @@ using Autofac;
 using Autofac.Integration.WebApi;
 using Microsoft.AspNet.WebHooks;
 using Microsoft.AspNet.WebHooks.Config;
+using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Description;
 
-namespace WebJobs.Script.WebHost.WebHooks
+namespace Microsoft.Azure.WebJobs.Script.WebHost.WebHooks
 {
     /// <summary>
     /// Class managing routing of requests to registered WebHook Receivers. It initializes an
@@ -23,7 +25,7 @@ namespace WebJobs.Script.WebHost.WebHooks
     public class WebHookReceiverManager : IDisposable
     {
         internal const string AzureFunctionsCallbackKey = "MS_AzureFunctionsCallback";
-
+        
         private readonly Dictionary<string, IWebHookReceiver> _receiverLookup;
         private HttpConfiguration _httpConfiguration;
         private bool disposedValue = false;
@@ -49,12 +51,15 @@ namespace WebJobs.Script.WebHost.WebHooks
         {
             // First check if there is a registered WebHook Receiver for this request, and if
             // so use it
-            HttpTriggerBindingMetadata httpFunctionMetadata = (HttpTriggerBindingMetadata)function.Metadata.InputBindings.FirstOrDefault(p => p.Type == BindingType.HttpTrigger);
+            HttpTriggerBindingMetadata httpFunctionMetadata = (HttpTriggerBindingMetadata)function.Metadata.InputBindings.FirstOrDefault(p => string.Compare("HttpTrigger", p.Type, StringComparison.OrdinalIgnoreCase) == 0);
             string webHookReceiver = httpFunctionMetadata.WebHookType;
             IWebHookReceiver receiver = null;
             if (string.IsNullOrEmpty(webHookReceiver) || !_receiverLookup.TryGetValue(webHookReceiver, out receiver))
             {
-                // If the function is a not a correctly configured WebHook return 500
+                // The function is not correctly configured. Log an error and return 500
+                string configurationError = string.Format(CultureInfo.InvariantCulture, "Invalid WebHook configuration. Unable to find a receiver for WebHook type '{0}'", webHookReceiver);
+                function.Invoker.OnError(new FunctionInvocationException(configurationError));
+
                 return new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError);
             }
 
@@ -68,9 +73,9 @@ namespace WebJobs.Script.WebHost.WebHooks
             // so our custom WebHookHandler can invoke it at the right time
             request.Properties.Add(AzureFunctionsCallbackKey, invokeFunction);
 
-            // TODO: Is there a better way? Requests content can't be read multiple
+            // Request content can't be read multiple
             // times, so this forces it to buffer
-            await request.Content.ReadAsStringAsync();
+            await request.Content.LoadIntoBufferAsync();
 
             string receiverId = function.Name.ToLowerInvariant();
             return await receiver.ReceiveAsync(receiverId, context, request);
@@ -114,6 +119,8 @@ namespace WebJobs.Script.WebHost.WebHooks
                 // get the callback from request properties
                 var requestHandler = (Func<HttpRequestMessage, Task<HttpResponseMessage>>)
                     context.Request.Properties[AzureFunctionsCallbackKey];
+
+                context.Request.Properties.Add(ScriptConstants.AzureFunctionsWebHookContextKey, context);
 
                 // Invoke the function
                 context.Response = await requestHandler(context.Request);

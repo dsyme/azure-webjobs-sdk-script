@@ -1,0 +1,16 @@
+﻿{
+    "bindings": [
+        {
+            "type": "queueTrigger",
+            "name": "input",
+            "direction": "in",
+            "queueName": "samples-mobiletables-node"
+        },
+        {
+            "type": "mobileTable",
+            "direction": "out",
+            "name": "item",
+            "tableName": "Item"
+        }
+    ]
+}

@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -9,12 +10,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Http;
 using System.Web.Http.Controllers;
-using Microsoft.Azure.WebJobs.Script;
 using Microsoft.Azure.WebJobs.Script.Description;
-using WebJobs.Script.WebHost.Filters;
-using WebJobs.Script.WebHost.WebHooks;
+using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
+using Microsoft.Azure.WebJobs.Script.WebHost.WebHooks;
 
-namespace WebJobs.Script.WebHost.Controllers
+namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 {
     /// <summary>
     /// Controller responsible for handling all http function invocations.
@@ -45,8 +45,17 @@ namespace WebJobs.Script.WebHost.Controllers
             SecretManager secretManager = (SecretManager)controllerContext.Configuration.DependencyResolver.GetService(typeof(SecretManager));
             AuthorizationLevel authorizationLevel = AuthorizationLevelAttribute.GetAuthorizationLevel(request, secretManager, functionName: function.Name);
 
+            if (function.Metadata.IsExcluded ||
+                (function.Metadata.IsDisabled && authorizationLevel != AuthorizationLevel.Admin))
+            {
+                // disabled functions are not publically addressable w/o Admin level auth,
+                // and excluded functions are also ignored here (though the check above will
+                // already exclude them)
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+            }
+
             // Dispatch the request
-            HttpTriggerBindingMetadata httpFunctionMetadata = (HttpTriggerBindingMetadata)function.Metadata.InputBindings.FirstOrDefault(p => p.Type == BindingType.HttpTrigger);
+            HttpTriggerBindingMetadata httpFunctionMetadata = (HttpTriggerBindingMetadata)function.Metadata.InputBindings.FirstOrDefault(p => string.Compare("HttpTrigger", p.Type, StringComparison.OrdinalIgnoreCase) == 0);
             bool isWebHook = !string.IsNullOrEmpty(httpFunctionMetadata.WebHookType);
             HttpResponseMessage response = null;
             if (isWebHook)
@@ -63,6 +72,10 @@ namespace WebJobs.Script.WebHost.Controllers
                     // then invoke this callback.
                     Func<HttpRequestMessage, Task<HttpResponseMessage>> invokeFunction = async (req) =>
                     {
+                        // Reset the content stream before passing the request down to the function
+                        Stream stream = await req.Content.ReadAsStreamAsync();
+                        stream.Seek(0, SeekOrigin.Begin);
+
                         return await _scriptHostManager.HandleRequestAsync(function, req, cancellationToken);
                     };
                     response = await _webHookReceiverManager.HandleRequestAsync(function, request, invokeFunction);

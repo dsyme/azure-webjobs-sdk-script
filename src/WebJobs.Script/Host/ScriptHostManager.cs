@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
@@ -58,6 +59,11 @@ namespace Microsoft.Azure.WebJobs.Script
             }
         }
 
+        /// <summary>
+        /// Gets the last host <see cref="Exception"/> that has occurred.
+        /// </summary>
+        public Exception LastError { get; private set; }
+
         public void RunAndBlock(CancellationToken cancellationToken = default(CancellationToken))
         {
             // Start the host and restart it if requested. Host Restarts will happen when
@@ -78,10 +84,15 @@ namespace Microsoft.Azure.WebJobs.Script
                     newInstance = _scriptHostFactory.Create(_config);
                     _traceWriter = newInstance.TraceWriter;
 
-                    // write any function initialization errors to the log file
+                    if (_traceWriter != null)
+                    {
+                        _traceWriter.Info("Starting Host");
+                    }
+                    newInstance.StartAsync(cancellationToken).GetAwaiter().GetResult();
+
+                    // log any function initialization errors
                     LogErrors(newInstance);
 
-                    newInstance.StartAsync(cancellationToken).Wait();
                     lock (_liveInstances)
                     {
                         _liveInstances.Add(newInstance);
@@ -91,6 +102,7 @@ namespace Microsoft.Azure.WebJobs.Script
 
                     // only after ALL initialization is complete do we set this flag
                     IsRunning = true;
+                    LastError = null;
 
                     // Wait for a restart signal. This event will automatically reset.
                     // While we're restarting, it is possible for another restart to be
@@ -111,11 +123,14 @@ namespace Microsoft.Azure.WebJobs.Script
                 }
                 catch (Exception ex)
                 {
+                    IsRunning = false;
+                    LastError = ex;
+
                     // We need to keep the host running, so we catch and log any errors
                     // then restart the host
                     if (_traceWriter != null)
                     {
-                        _traceWriter.Error("A ScriptHost error occurred", ex);
+                        _traceWriter.Error("A ScriptHost error has occurred", ex);
                     }
 
                     // If a ScriptHost instance was created before the exception was thrown
@@ -135,7 +150,7 @@ namespace Microsoft.Azure.WebJobs.Script
                     // Wait for a short period of time before restarting to
                     // avoid cases where a host level config error might cause
                     // a rapid restart cycle
-                    Task.Delay(5000).Wait();
+                    Task.Delay(5000).GetAwaiter().GetResult();
                 }
             }
             while (!_stopped && !cancellationToken.IsCancellationRequested);
@@ -177,6 +192,10 @@ namespace Microsoft.Azure.WebJobs.Script
             try
             {
                 // this thread now owns the instance
+                if (instance.TraceWriter != null)
+                {
+                    instance.TraceWriter.Info("Stopping Host");
+                }
                 await instance.StopAsync();
             }
             finally
@@ -201,6 +220,8 @@ namespace Microsoft.Azure.WebJobs.Script
                 {
                     instance.Dispose();
                 }
+
+                IsRunning = false;
             }
             catch
             {
@@ -226,6 +247,8 @@ namespace Microsoft.Azure.WebJobs.Script
 
         protected virtual void OnHostStarted()
         {
+            var metricsLogger = _config.HostConfig.GetService<IMetricsLogger>();
+            metricsLogger.LogEvent(new HostStarted(Instance));
         }
 
         public void Dispose()

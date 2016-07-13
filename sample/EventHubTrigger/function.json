@@ -1,0 +1,19 @@
+{
+    "bindings": [
+        {
+            "type": "eventHubTrigger",
+            "name": "input",
+            "direction": "in",
+            "connection": "AzureWebJobsEventHubReceiver",
+            "path": "%AzureWebJobsEventHubPath%",
+            "consumerGroup": "$Default"
+        },
+        {
+            "type": "eventHub",
+            "name": "output",
+            "direction": "out",
+            "connection": "AzureWebJobsEventHubSender",
+            "path": "%AzureWebJobsEventHubPath%"
+        }
+    ]
+}

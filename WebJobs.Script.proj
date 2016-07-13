@@ -6,6 +6,11 @@
     <SkipStrongNamesExe>packages\Microsoft.Web.SkipStrongNames.1.0.0\tools\SkipStrongNames.exe</SkipStrongNamesExe>
     <SkipStrongNamesXml>tools\SkipStrongNames.xml</SkipStrongNamesXml>
     <PublishPath Condition=" '$(PublishPath)' == '' ">bin</PublishPath>
+    <BuildNumber Condition=" '$(BuildNumber)' == '' ">0</BuildNumber>
+    <SiteExtensionVersion>0.3.$(BuildNumber)</SiteExtensionVersion>
+    <SiteExtensionBasePath>$(PublishPath)\Packages\SiteExtension</SiteExtensionBasePath>
+    <SiteExtensionPath>$(SiteExtensionBasePath)\$(SiteExtensionVersion)</SiteExtensionPath>
+    <ExtensionXml>src\SiteExtension\extension.xml</ExtensionXml>
     <SetConfiguration Condition=" '$(Configuration)' != '' ">Configuration=$(Configuration)</SetConfiguration>
     <SetPlatform Condition=" '$(Platform)' != '' ">Platform=$(Platform)</SetPlatform>
   </PropertyGroup>
@@ -21,6 +26,10 @@
       <PublishPath>$(PublishPath)\Binaries</PublishPath>
     </Build>
     <Build Include="src\WebJobs.Script.NuGet\WebJobs.Script.nuproj">
+      <PublishType>File</PublishType>
+      <PublishPath>$(PublishPath)\Packages</PublishPath>
+    </Build>
+    <Build Include="src\WebJobs.Script.Extensibility.NuGet\WebJobs.Script.Extensibility.nuproj">
       <PublishType>File</PublishType>
       <PublishPath>$(PublishPath)\Packages</PublishPath>
     </Build>
@@ -106,22 +115,42 @@
       InputPath=".\src\WebJobs.Script.WebHost\Publish"
       OutputFileName="$(PublishPath)\Packages\Functions.Private.zip"
       OverwriteExistingFile="true"/>
+    
+    <!--Create site extension package  -->
+    <MakeDir Directories="@(SiteExtensionPath)"/>
+    
+    <ItemGroup>
+        <SiteExtensionSource Include=".\src\WebJobs.Script.WebHost\Publish\SiteExtensions\Functions\**\*.*" />
+    </ItemGroup>
+    
+    <Copy SourceFiles="@(SiteExtensionSource)" DestinationFiles="@(SiteExtensionSource->'$(SiteExtensionPath)\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="$(ExtensionXml)" DestinationFolder="$(SiteExtensionBasePath)" />
+    
+    <Zip
+      InputPath="$(SiteExtensionBasePath)"
+      OutputFileName="$(PublishPath)\Packages\Functions.$(SiteExtensionVersion).zip"
+      OverwriteExistingFile="true"/>
+      
+    <RemoveDir Directories="$(SiteExtensionBasePath)" />
   </Target>
 
   <UsingTask TaskName="Xunit.Runner.MSBuild.xunit" AssemblyFile="packages\xunit.MSBuild.2.0.0.0\tools\xunit.runner.msbuild.dll"/>
 
-  <Target Name="UnitTest" DependsOnTargets="CheckSkipStrongNames;Build">
+  <Target Name="TestBuild" DependsOnTargets="CheckSkipStrongNames;Build">
     <ItemGroup>
       <UnitTestProjects Include="test\WebJobs.Script.Tests\WebJobs.Script.Tests.csproj"/>
     </ItemGroup>
 
     <MSBuild Projects="@(UnitTestProjects)"
+     
              Properties="$(SetConfiguration); $(SetPlatform)"
              BuildInParallel="$(BuildInParallel)">
       <Output TaskParameter="TargetOutputs" ItemName="UnitTestAssemblies"/>
     </MSBuild>
-
-    <xunit Assemblies="@(UnitTestAssemblies)" ExcludeTraits="$(ExcludedTestTraits)"/>
+  </Target>
+  
+  <Target Name="UnitTest" DependsOnTargets="TestBuild">
+    <xunit Assemblies="@(UnitTestAssemblies)" ExcludeTraits="$(ExcludedTestTraits)" />
   </Target>
 
   <Target Name="Clean" DependsOnTargets="GetBinplace">

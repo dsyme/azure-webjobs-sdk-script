@@ -11,11 +11,19 @@ using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Extensions;
+using Microsoft.Azure.WebJobs.Extensions.ApiHub;
+using Microsoft.Azure.WebJobs.Extensions.Bindings;
+using Microsoft.Azure.WebJobs.Extensions.DocumentDB;
+using Microsoft.Azure.WebJobs.Extensions.MobileApps;
+using Microsoft.Azure.WebJobs.Extensions.NotificationHubs;
 using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Host.Indexers;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
-using Microsoft.Azure.WebJobs.ServiceBus;
+using Microsoft.Azure.WebJobs.Script.Extensibility;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Script
@@ -23,8 +31,6 @@ namespace Microsoft.Azure.WebJobs.Script
     public class ScriptHost : JobHost
     {
         private const string HostAssemblyName = "ScriptHost";
-        private const string HostConfigFileName = "host.json";
-        internal const string FunctionConfigFileName = "function.json";
         private readonly AutoResetEvent _restartEvent = new AutoResetEvent(false);
         private Action<FileSystemEventArgs> _restart;
         private FileSystemWatcher _fileWatcher;
@@ -34,59 +40,8 @@ namespace Microsoft.Azure.WebJobs.Script
             : base(scriptConfig.HostConfig)
         {
             ScriptConfig = scriptConfig;
-
-            if (scriptConfig.FileLoggingEnabled)
-            {
-                string hostLogFilePath = Path.Combine(scriptConfig.RootLogPath, "Host");
-                TraceWriter = new FileTraceWriter(hostLogFilePath, TraceLevel.Verbose);
-                scriptConfig.HostConfig.Tracing.Tracers.Add(TraceWriter);
-            }
-            else
-            {
-                TraceWriter = NullTraceWriter.Instance;
-            }
-
-            if (scriptConfig.TraceWriter != null)
-            {
-                scriptConfig.HostConfig.Tracing.Tracers.Add(scriptConfig.TraceWriter);
-            }
-            else
-            {
-                scriptConfig.TraceWriter = NullTraceWriter.Instance;
-            }
-
-            if (scriptConfig.FileWatchingEnabled)
-            {
-                _fileWatcher = new FileSystemWatcher(scriptConfig.RootScriptPath)
-                {
-                    IncludeSubdirectories = true,
-                    EnableRaisingEvents = true
-                };
-                _fileWatcher.Changed += OnFileChanged;
-                _fileWatcher.Created += OnFileChanged;
-                _fileWatcher.Deleted += OnFileChanged;
-                _fileWatcher.Renamed += OnFileChanged;
-            }
-
-            // If a file change should result in a restart, we debounce the event to
-            // ensure that only a single restart is triggered within a specific time window.
-            // This allows us to deal with a large set of file change events that might
-            // result from a bulk copy/unzip operation. In such cases, we only want to
-            // restart after ALL the operations are complete and there is a quiet period.
-            _restart = (e) =>
-            {
-                TraceWriter.Verbose(string.Format(CultureInfo.InvariantCulture, "File change of type '{0}' detected for '{1}'", e.ChangeType, e.FullPath));
-                TraceWriter.Verbose("Host configuration has changed. Signaling restart.");
-
-                // signal host restart
-                _restartEvent.Set();
-            };
-            _restart = _restart.Debounce(500);
-
-            // take a snapshot so we can detect function additions/removals
-            _directoryCountSnapshot = Directory.EnumerateDirectories(ScriptConfig.RootScriptPath).Count();
-
             FunctionErrors = new Dictionary<string, Collection<string>>(StringComparer.OrdinalIgnoreCase);
+            NodeFunctionInvoker.UnhandledException += OnUnhandledException;
         }
 
         public TraceWriter TraceWriter { get; private set; }
@@ -105,6 +60,18 @@ namespace Microsoft.Azure.WebJobs.Script
             }
         }
 
+        internal void AddFunctionError(string functionName, string error)
+        {
+            functionName = Utility.GetFunctionShortName(functionName);
+
+            Collection<string> functionErrors = new Collection<string>();
+            if (!FunctionErrors.TryGetValue(functionName, out functionErrors))
+            {
+                FunctionErrors[functionName] = functionErrors = new Collection<string>();
+            }
+            functionErrors.Add(error);
+        }
+
         public async Task CallAsync(string method, Dictionary<string, object> arguments, CancellationToken cancellationToken = default(CancellationToken))
         {
             // TODO: Don't hardcode Functions Type name
@@ -120,22 +87,115 @@ namespace Microsoft.Azure.WebJobs.Script
 
         protected virtual void Initialize()
         {
-            IMetricsLogger metricsLogger = ScriptConfig.HostConfig.GetService<IMetricsLogger>();
-            if (metricsLogger == null)
-            {
-                ScriptConfig.HostConfig.AddService<IMetricsLogger>(new MetricsLogger());
-            }
+            // read host.json and apply to JobHostConfiguration
+            string hostConfigFilePath = Path.Combine(ScriptConfig.RootScriptPath, ScriptConstants.HostMetadataFileName);
 
-            List<FunctionDescriptorProvider> descriptionProviders = new List<FunctionDescriptorProvider>()
+            // If it doesn't exist, create an empty JSON file
+            if (!File.Exists(hostConfigFilePath))
             {
-                new ScriptFunctionDescriptorProvider(this, ScriptConfig),
-                new NodeFunctionDescriptorProvider(this, ScriptConfig),
-                new CSharpFunctionDescriptionProvider(this, ScriptConfig)
-            };
+                File.WriteAllText(hostConfigFilePath, "{}");
+            }
 
             if (ScriptConfig.HostConfig.IsDevelopment)
             {
                 ScriptConfig.HostConfig.UseDevelopmentSettings();
+            }
+            else
+            {
+                // TEMP: Until https://github.com/Azure/azure-webjobs-sdk-script/issues/100 is addressed
+                // we're using some presets that are a good middle ground
+                ScriptConfig.HostConfig.Queues.MaxPollingInterval = TimeSpan.FromSeconds(10);
+                ScriptConfig.HostConfig.Singleton.ListenerLockPeriod = TimeSpan.FromSeconds(15);
+            }
+
+            string json = File.ReadAllText(hostConfigFilePath);
+
+            JObject hostConfig;
+            try
+            {
+                hostConfig = JObject.Parse(json);
+            }
+            catch (JsonException ex)
+            {
+                throw new FormatException(string.Format("Unable to parse {0} file.", ScriptConstants.HostMetadataFileName), ex);
+            }
+
+            ApplyConfiguration(hostConfig, ScriptConfig);
+
+            // Set up a host level TraceMonitor that will receive notificaition
+            // of ALL errors that occur. This allows us to inspect/log errors.
+            var traceMonitor = new TraceMonitor()
+                .Filter(p => { return true; })
+                .Subscribe(HandleHostError);
+            ScriptConfig.HostConfig.Tracing.Tracers.Add(traceMonitor);
+
+            TraceWriter = ScriptConfig.TraceWriter;
+            TraceLevel hostTraceLevel = ScriptConfig.HostConfig.Tracing.ConsoleLevel;
+            if (ScriptConfig.FileLoggingEnabled)
+            {
+                string hostLogFilePath = Path.Combine(ScriptConfig.RootLogPath, "Host");
+                TraceWriter fileTraceWriter = new FileTraceWriter(hostLogFilePath, hostTraceLevel);
+                if (TraceWriter != null)
+                {
+                    // create a composite writer so our host logs are written to both
+                    TraceWriter = new CompositeTraceWriter(new[] { TraceWriter, fileTraceWriter });
+                }
+                else
+                {
+                    TraceWriter = fileTraceWriter;
+                }
+            }
+
+            if (TraceWriter != null)
+            {
+                ScriptConfig.HostConfig.Tracing.Tracers.Add(TraceWriter);
+            }
+            else
+            {
+                // if no TraceWriter has been configured, default it to Console
+                TraceWriter = new ConsoleTraceWriter(hostTraceLevel);
+            }
+
+            var bindingProviders = LoadBindingProviders(ScriptConfig, hostConfig, TraceWriter);
+            ScriptConfig.BindingProviders = bindingProviders;
+
+            TraceWriter.Info(string.Format(CultureInfo.InvariantCulture, "Reading host configuration file '{0}'", hostConfigFilePath));
+
+            if (ScriptConfig.FileWatchingEnabled)
+            {
+                _fileWatcher = new FileSystemWatcher(ScriptConfig.RootScriptPath)
+                {
+                    IncludeSubdirectories = true,
+                    EnableRaisingEvents = true
+                };
+                _fileWatcher.Changed += OnFileChanged;
+                _fileWatcher.Created += OnFileChanged;
+                _fileWatcher.Deleted += OnFileChanged;
+                _fileWatcher.Renamed += OnFileChanged;
+            }
+
+            // If a file change should result in a restart, we debounce the event to
+            // ensure that only a single restart is triggered within a specific time window.
+            // This allows us to deal with a large set of file change events that might
+            // result from a bulk copy/unzip operation. In such cases, we only want to
+            // restart after ALL the operations are complete and there is a quiet period.
+            _restart = (e) =>
+            {
+                TraceWriter.Info(string.Format(CultureInfo.InvariantCulture, "File change of type '{0}' detected for '{1}'", e.ChangeType, e.FullPath));
+                TraceWriter.Info("Host configuration has changed. Signaling restart.");
+
+                // signal host restart
+                _restartEvent.Set();
+            };
+            _restart = _restart.Debounce(500);
+
+            // take a snapshot so we can detect function additions/removals
+            _directoryCountSnapshot = Directory.EnumerateDirectories(ScriptConfig.RootScriptPath).Count();
+
+            IMetricsLogger metricsLogger = ScriptConfig.HostConfig.GetService<IMetricsLogger>();
+            if (metricsLogger == null)
+            {
+                ScriptConfig.HostConfig.AddService<IMetricsLogger>(new MetricsLogger());
             }
 
             // Bindings may use name resolution, so provide this before reading the bindings. 
@@ -147,59 +207,100 @@ namespace Microsoft.Azure.WebJobs.Script
                 // Disable core storage 
                 ScriptConfig.HostConfig.StorageConnectionString = null;
             }
-
-            var dashboardString = AmbientConnectionStringProvider.Instance.GetConnectionString(ConnectionStringNames.Dashboard);
-            if (dashboardString == null)
-            {
-                // Disable logging if no storage account provided
-                ScriptConfig.HostConfig.DashboardConnectionString = null;
-            }
-
+                      
             ScriptConfig.HostConfig.NameResolver = nameResolver;
 
-            // read host.json and apply to JobHostConfiguration
-            string hostConfigFilePath = Path.Combine(ScriptConfig.RootScriptPath, HostConfigFileName);
-
-            // If it doesn't exist, create an empty JSON file
-            if (!File.Exists(hostConfigFilePath))
+            List<FunctionDescriptorProvider> descriptionProviders = new List<FunctionDescriptorProvider>()
             {
-                File.WriteAllText(hostConfigFilePath, "{}");
-            }
-
-            TraceWriter.Verbose(string.Format(CultureInfo.InvariantCulture, "Reading host configuration file '{0}'", hostConfigFilePath));
-            string json = File.ReadAllText(hostConfigFilePath);
-            JObject hostConfig = JObject.Parse(json);
-            ApplyConfiguration(hostConfig, ScriptConfig);
+                new ScriptFunctionDescriptorProvider(this, ScriptConfig),
+                new NodeFunctionDescriptorProvider(this, ScriptConfig),
+                new DotNetFunctionDescriptorProvider(this, ScriptConfig),
+                new PowerShellFunctionDescriptorProvider(this, ScriptConfig)
+            };
 
             // read all script functions and apply to JobHostConfiguration
             Collection<FunctionDescriptor> functions = ReadFunctions(ScriptConfig, descriptionProviders);
             string defaultNamespace = "Host";
             string typeName = string.Format(CultureInfo.InvariantCulture, "{0}.{1}", defaultNamespace, "Functions");
-            TraceWriter.Verbose(string.Format(CultureInfo.InvariantCulture, "Generating {0} job function(s)", functions.Count));
+            TraceWriter.Info(string.Format(CultureInfo.InvariantCulture, "Generating {0} job function(s)", functions.Count));
             Type type = FunctionGenerator.Generate(HostAssemblyName, typeName, functions);
             List<Type> types = new List<Type>();
             types.Add(type);
 
             ScriptConfig.HostConfig.TypeLocator = new TypeLocator(types);
 
-            ApplyBindingConfiguration(functions, ScriptConfig.HostConfig);
-
-            Functions = functions;
-        }
-
-        // Bindings may require us to update JobHostConfiguration. 
-        private static void ApplyBindingConfiguration(Collection<FunctionDescriptor> functions, JobHostConfiguration hostConfig)
-        {
-            JobHostConfigurationBuilder builder = new JobHostConfigurationBuilder(hostConfig);
-
-            foreach (var func in functions)
+            // Allow BindingProviders to complete their initialization
+            foreach (var bindingProvider in ScriptConfig.BindingProviders)
             {
-                foreach (var metadata in func.Metadata.InputBindings.Concat(func.Metadata.OutputBindings))
+                try
                 {
-                    metadata.ApplyToConfig(builder);
+                    bindingProvider.Initialize();
+                }
+                catch (Exception ex)
+                {
+                    // If we're unable to initialize a binding provider for any reason, log the error
+                    // and continue
+                    TraceWriter.Error(string.Format("Error initializing binding provider '{0}'", bindingProvider.GetType().FullName), ex);
                 }
             }
-            builder.Done();
+
+            Functions = functions;
+
+            if (ScriptConfig.FileLoggingEnabled)
+            {
+                PurgeOldLogDirectories();
+            }
+        }
+
+        /// <summary>
+        /// Iterate through all function log directories and remove any that don't
+        /// correspond to a function.
+        /// </summary>
+        private void PurgeOldLogDirectories()
+        {
+            try
+            {
+                if (!Directory.Exists(this.ScriptConfig.RootScriptPath))
+                {
+                    return;
+                }
+
+                // Create a lookup of all potential functions (whether they're valid or not)
+                // It is important that we determine functions based on the presence of a folder,
+                // not whether we've identified a valid function from that folder. This ensures
+                // that we don't delete logs/secrets for functions that transition into/out of
+                // invalid unparsable states.
+                var functionLookup = Directory.EnumerateDirectories(this.ScriptConfig.RootScriptPath).ToLookup(p => Path.GetFileName(p), StringComparer.OrdinalIgnoreCase);
+
+                string rootLogFilePath = Path.Combine(this.ScriptConfig.RootLogPath, "Function");
+                if (!Directory.Exists(rootLogFilePath))
+                {
+                    return;
+                }
+
+                var logFileDirectory = new DirectoryInfo(rootLogFilePath);
+                foreach (var logDir in logFileDirectory.GetDirectories())
+                {
+                    if (!functionLookup.Contains(logDir.Name))
+                    {
+                        // the directory no longer maps to a running function
+                        // so delete it
+                        try
+                        {
+                            logDir.Delete(recursive: true);
+                        }
+                        catch
+                        {
+                            // Purge is best effort
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Purge is best effort
+                TraceWriter.Error("An error occurred while purging log files", ex);
+            }
         }
 
         public static ScriptHost Create(ScriptHostConfiguration scriptConfig = null)
@@ -221,14 +322,57 @@ namespace Microsoft.Azure.WebJobs.Script
             }
             catch (Exception ex)
             {
-                scriptHost.TraceWriter.Error("ScriptHost initialization failed", ex);
+                if (scriptHost.TraceWriter != null)
+                {
+                    scriptHost.TraceWriter.Error("ScriptHost initialization failed", ex);
+                }
                 throw;
             }
 
             return scriptHost;
         }
 
-        private static FunctionMetadata ParseFunctionMetadata(string functionName, INameResolver nameResolver, JObject configMetadata)
+        private static Collection<ScriptBindingProvider> LoadBindingProviders(ScriptHostConfiguration config, JObject hostMetadata, TraceWriter traceWriter)
+        {
+            JobHostConfiguration hostConfig = config.HostConfig;
+
+            // Register our built in extensions
+            var bindingProviderTypes = new Collection<Type>()
+            {
+                // binding providers defined in this assembly
+                typeof(WebJobsCoreScriptBindingProvider),
+                typeof(ServiceBusScriptBindingProvider),
+
+                // binding providers defined in known extension assemblies
+                typeof(CoreExtensionsScriptBindingProvider),
+                typeof(ApiHubScriptBindingProvider),
+                typeof(DocumentDBScriptBindingProvider),
+                typeof(MobileAppsScriptBindingProvider),
+                typeof(NotificationHubScriptBindingProvider),
+                typeof(SendGridScriptBindingProvider)
+            };
+
+            // Create the binding providers
+            var bindingProviders = new Collection<ScriptBindingProvider>();
+            foreach (var bindingProviderType in bindingProviderTypes)
+            {
+                try
+                {
+                    var provider = (ScriptBindingProvider)Activator.CreateInstance(bindingProviderType, new object[] { hostConfig, hostMetadata, traceWriter });
+                    bindingProviders.Add(provider);
+                }
+                catch (Exception ex)
+                {
+                    // If we're unable to load create a binding provider for any reason, log
+                    // the error and continue
+                    traceWriter.Error(string.Format("Unable to create binding provider '{0}'", bindingProviderType.FullName), ex);
+                }
+            }
+
+            return bindingProviders;
+        }
+
+        private static FunctionMetadata ParseFunctionMetadata(string functionName, JObject configMetadata)
         {
             FunctionMetadata functionMetadata = new FunctionMetadata
             {
@@ -246,7 +390,7 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 foreach (JObject binding in bindingArray)
                 {
-                    BindingMetadata bindingMetadata = ParseBindingMetadata(binding, nameResolver);
+                    BindingMetadata bindingMetadata = BindingMetadata.Create(binding);
                     functionMetadata.Bindings.Add(bindingMetadata);
                     if (bindingMetadata.IsTrigger)
                     {
@@ -262,76 +406,14 @@ namespace Microsoft.Azure.WebJobs.Script
                 functionMetadata.IsDisabled = true;
             }
 
+            JToken value = null;
+            if (configMetadata.TryGetValue("excluded", StringComparison.OrdinalIgnoreCase, out value) &&
+                value.Type == JTokenType.Boolean)
+            {
+                functionMetadata.IsExcluded = (bool)value;
+            }
+
             return functionMetadata;
-        }
-
-        private static BindingMetadata ParseBindingMetadata(JObject binding, INameResolver nameResolver)
-        {
-            BindingMetadata bindingMetadata = null;
-            string bindingTypeValue = (string)binding["type"];
-            string bindingDirectionValue = (string)binding["direction"];
-            BindingType bindingType = default(BindingType);
-            BindingDirection bindingDirection = default(BindingDirection);
-
-            if (!string.IsNullOrEmpty(bindingDirectionValue) &&
-                !Enum.TryParse<BindingDirection>(bindingDirectionValue, true, out bindingDirection))
-            {
-                throw new FormatException(string.Format(CultureInfo.InvariantCulture, "'{0}' is not a valid binding direction.", bindingDirectionValue));
-            }
-
-            if (!string.IsNullOrEmpty(bindingTypeValue) &&
-                !Enum.TryParse<BindingType>(bindingTypeValue, true, out bindingType))
-            {
-                throw new FormatException(string.Format(CultureInfo.InvariantCulture, "'{0}' is not a valid binding type.", bindingTypeValue));
-            }
-
-            switch (bindingType)
-            {
-                case BindingType.EventHubTrigger:
-                case BindingType.EventHub:
-                    bindingMetadata = binding.ToObject<EventHubBindingMetadata>();
-                    break;
-                case BindingType.QueueTrigger:
-                case BindingType.Queue:
-                    bindingMetadata = binding.ToObject<QueueBindingMetadata>();
-                    break;
-                case BindingType.BlobTrigger:
-                case BindingType.Blob:
-                    bindingMetadata = binding.ToObject<BlobBindingMetadata>();
-                    break;
-                case BindingType.ServiceBusTrigger:
-                case BindingType.ServiceBus:
-                    bindingMetadata = binding.ToObject<ServiceBusBindingMetadata>();
-                    break;
-                case BindingType.HttpTrigger:
-                    bindingMetadata = binding.ToObject<HttpTriggerBindingMetadata>();
-                    break;
-                case BindingType.Http:
-                    bindingMetadata = binding.ToObject<HttpBindingMetadata>();
-                    break;
-                case BindingType.Table:
-                    bindingMetadata = binding.ToObject<TableBindingMetadata>();
-                    break;
-                case BindingType.ManualTrigger:
-                    bindingMetadata = binding.ToObject<BindingMetadata>();
-                    break;
-                case BindingType.TimerTrigger:
-                    bindingMetadata = binding.ToObject<TimerBindingMetadata>();
-                    break;
-                case BindingType.EasyTable:
-                    bindingMetadata = binding.ToObject<EasyTableBindingMetadata>();
-                    break;
-                case BindingType.DocumentDB:
-                    bindingMetadata = binding.ToObject<DocumentDBBindingMetadata>();
-                    break;
-            }
-
-            bindingMetadata.Type = bindingType;
-            bindingMetadata.Direction = bindingDirection;
-
-            nameResolver.ResolveAllProperties(bindingMetadata);
-
-            return bindingMetadata;
         }
 
         private Collection<FunctionDescriptor> ReadFunctions(ScriptHostConfiguration config, IEnumerable<FunctionDescriptorProvider> descriptorProviders)
@@ -346,7 +428,7 @@ namespace Microsoft.Azure.WebJobs.Script
                 try
                 {
                     // read the function config
-                    string functionConfigPath = Path.Combine(scriptDir, FunctionConfigFileName);
+                    string functionConfigPath = Path.Combine(scriptDir, ScriptConstants.FunctionMetadataFileName);
                     if (!File.Exists(functionConfigPath))
                     {
                         // not a function directory
@@ -363,53 +445,41 @@ namespace Microsoft.Azure.WebJobs.Script
                         continue;
                     }
 
+                    ValidateFunctionName(functionName);
+
                     // TODO: we need to define a json schema document and do
-                    // schema validation
+                    // schema validation and give more informative responses 
                     string json = File.ReadAllText(functionConfigPath);
-                    JObject configMetadata = JObject.Parse(json);
-                    FunctionMetadata metadata = ParseFunctionMetadata(functionName, config.HostConfig.NameResolver, configMetadata);
+                    JObject functionConfig = JObject.Parse(json);
+                    FunctionMetadata metadata = ParseFunctionMetadata(functionName, functionConfig);
+
+                    if (metadata.IsExcluded)
+                    {
+                        TraceWriter.Info(string.Format("Function '{0}' is marked as excluded", functionName));
+                        continue;
+                    }
 
                     // determine the primary script
-                    string[] functionFiles = Directory.EnumerateFiles(scriptDir).Where(p => Path.GetFileName(p).ToLowerInvariant() != FunctionConfigFileName).ToArray();
+                    string[] functionFiles = Directory.EnumerateFiles(scriptDir).Where(p => Path.GetFileName(p).ToLowerInvariant() != ScriptConstants.FunctionMetadataFileName).ToArray();
                     if (functionFiles.Length == 0)
                     {
                         AddFunctionError(functionName, "No function script files present.");
                         continue;
                     }
-                    else if (functionFiles.Length == 1)
+                    string scriptFile = DeterminePrimaryScriptFile(functionConfig, functionFiles);
+                    if (string.IsNullOrEmpty(scriptFile))
                     {
-                        // if there is only a single file, that file is primary
-                        metadata.Source = functionFiles[0];
+                        AddFunctionError(functionName, 
+                            "Unable to determine the primary function script. Try renaming your entry point script to 'run' (or 'index' in the case of Node), " +
+                            "or alternatively you can specify the name of the entry point script explicitly by adding a 'scriptFile' property to your function metadata.");
+                        continue;
                     }
-                    else
-                    {
-                        // if there is a "run" file, that file is primary
-                        string functionPrimary = null;
-                        functionPrimary = functionFiles.FirstOrDefault(p => Path.GetFileNameWithoutExtension(p).ToLowerInvariant() == "run");
-                        if (string.IsNullOrEmpty(functionPrimary))
-                        {
-                            // for Node, any index.js file is primary
-                            functionPrimary = functionFiles.FirstOrDefault(p => Path.GetFileName(p).ToLowerInvariant() == "index.js");
-                            if (string.IsNullOrEmpty(functionPrimary))
-                            {
-                                // finally, if there is an explicit primary file indicated
-                                // in config, use it
-                                JToken token = configMetadata["source"];
-                                if (token != null)
-                                {
-                                    string sourceFileName = (string)token;
-                                    functionPrimary = Path.Combine(scriptDir, sourceFileName);
-                                }
-                            }
-                        }
+                    metadata.ScriptFile = scriptFile;
 
-                        if (string.IsNullOrEmpty(functionPrimary))
-                        {
-                            AddFunctionError(functionName, "Unable to determine primary function script.");
-                            continue;
-                        }
-                        metadata.Source = functionPrimary;
-                    }
+                    // determine the script type based on the primary script file extension
+                    metadata.ScriptType = ParseScriptType(metadata.ScriptFile);
+
+                    metadata.EntryPoint = (string)functionConfig["entryPoint"];
 
                     metadatas.Add(metadata);
                 }
@@ -421,6 +491,77 @@ namespace Microsoft.Azure.WebJobs.Script
             }
 
             return ReadFunctions(metadatas, descriptorProviders);
+        }
+
+        internal static void ValidateFunctionName(string functionName)
+        {
+            if (string.Compare(Path.GetFileNameWithoutExtension(ScriptConstants.HostMetadataFileName), functionName, StringComparison.OrdinalIgnoreCase) == 0)
+            {
+                throw new InvalidOperationException(string.Format("'{0}' is not a valid function name.", functionName));
+            }
+        }
+
+        /// <summary>
+        /// Determines which script should be considered the "primary" entry point script.
+        /// </summary>
+        internal static string DeterminePrimaryScriptFile(JObject functionConfig, string[] functionFiles)
+        {
+            if (functionFiles.Length == 1)
+            {
+                // if there is only a single file, that file is primary
+                return functionFiles[0];
+            }
+            else
+            {
+                // First see if there is an explicit primary file indicated
+                // in config. If so use that.
+                string functionPrimary = null;
+                string scriptFileName = (string)functionConfig["scriptFile"];
+                if (!string.IsNullOrEmpty(scriptFileName))
+                {
+                    functionPrimary = functionFiles.FirstOrDefault(p =>
+                        string.Compare(Path.GetFileName(p), scriptFileName, StringComparison.OrdinalIgnoreCase) == 0);
+                }
+                else
+                {
+                    // if there is a "run" file, that file is primary,
+                    // for Node, any index.js file is primary
+                    functionPrimary = functionFiles.FirstOrDefault(p => 
+                        Path.GetFileNameWithoutExtension(p).ToLowerInvariant() == "run" ||
+                        Path.GetFileName(p).ToLowerInvariant() == "index.js");
+                }
+
+                return functionPrimary;
+            }
+        }
+
+        private static ScriptType ParseScriptType(string scriptFilePath)
+        {
+            string extension = Path.GetExtension(scriptFilePath).ToLowerInvariant().TrimStart('.');
+
+            switch (extension)
+            {
+                case "csx":
+                case "cs":
+                    return ScriptType.CSharp;
+                case "js":
+                    return ScriptType.Javascript;
+                case "ps1":
+                    return ScriptType.PowerShell;
+                case "cmd":
+                case "bat":
+                    return ScriptType.WindowsBatch;
+                case "py":
+                    return ScriptType.Python;
+                case "php":
+                    return ScriptType.PHP;
+                case "sh":
+                    return ScriptType.Bash;
+                case "fsx":
+                    return ScriptType.FSharp;
+                default:
+                    return ScriptType.Unknown;
+            }
         }
 
         internal Collection<FunctionDescriptor> ReadFunctions(List<FunctionMetadata> metadatas, IEnumerable<FunctionDescriptorProvider> descriptorProviders)
@@ -485,32 +626,9 @@ namespace Microsoft.Azure.WebJobs.Script
                 scriptConfig.FileWatchingEnabled = (bool)watchFiles;
             }
 
-            // Apply Queues configuration
-            JObject configSection = (JObject)config["queues"];
-            JToken value = null;
-            if (configSection != null)
-            {
-                if (configSection.TryGetValue("maxPollingInterval", out value))
-                {
-                    hostConfig.Queues.MaxPollingInterval = TimeSpan.FromMilliseconds((int)value);
-                }
-                if (configSection.TryGetValue("batchSize", out value))
-                {
-                    hostConfig.Queues.BatchSize = (int)value;
-                }
-                if (configSection.TryGetValue("maxDequeueCount", out value))
-                {
-                    hostConfig.Queues.MaxDequeueCount = (int)value;
-                }
-                if (configSection.TryGetValue("newBatchThreshold", out value))
-                {
-                    hostConfig.Queues.NewBatchThreshold = (int)value;
-                }
-            }
-
             // Apply Singleton configuration
-            configSection = (JObject)config["singleton"];
-            value = null;
+            JObject configSection = (JObject)config["singleton"];
+            JToken value = null;
             if (configSection != null)
             {
                 if (configSection.TryGetValue("lockPeriod", out value))
@@ -535,51 +653,132 @@ namespace Microsoft.Azure.WebJobs.Script
                 }
             }
 
-            // Apply ServiceBus configuration
-            ServiceBusConfiguration serviceBusConfig = new ServiceBusConfiguration();
-            configSection = (JObject)config["serviceBus"];
-            value = null;
+            // Apply Tracing/Logging configuration
+            configSection = (JObject)config["tracing"];
             if (configSection != null)
             {
-                if (configSection.TryGetValue("maxConcurrentCalls", out value))
+                if (configSection.TryGetValue("consoleLevel", out value))
                 {
-                    serviceBusConfig.MessageOptions.MaxConcurrentCalls = (int)value;
+                    TraceLevel consoleLevel;
+                    if (Enum.TryParse<TraceLevel>((string)value, true, out consoleLevel))
+                    {
+                        hostConfig.Tracing.ConsoleLevel = consoleLevel;
+                    }
+                }
+
+                if (configSection.TryGetValue("fileLoggingEnabled", out value))
+                {
+                    scriptConfig.FileLoggingEnabled = (bool)value;
                 }
             }
-            hostConfig.UseServiceBus(serviceBusConfig);
-
-            // Apply Tracing configuration
-            configSection = (JObject)config["tracing"];
-            if (configSection != null && configSection.TryGetValue("consoleLevel", out value))
-            {
-                TraceLevel consoleLevel;
-                if (Enum.TryParse<TraceLevel>((string)value, true, out consoleLevel))
-                {
-                    hostConfig.Tracing.ConsoleLevel = consoleLevel;
-                }
-            }
-
-            hostConfig.UseTimers();
-            hostConfig.UseCore();
         }
 
-        private void AddFunctionError(string functionName, string error)
+        private void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
-            Collection<string> errors = null;
-            if (!FunctionErrors.TryGetValue(functionName, out errors))
+            HandleHostError((Exception)e.ExceptionObject);
+        }
+
+        private void HandleHostError(Microsoft.Azure.WebJobs.Extensions.TraceFilter traceFilter)
+        {
+            // TODO: figure out why sometimes we get null events
+            var events = traceFilter.Events.Where(p => p != null).ToArray();
+
+            foreach (TraceEvent traceEvent in events)
             {
-                errors = new Collection<string>();
-                FunctionErrors[functionName] = errors;
+                var exception = traceEvent.Exception ?? new InvalidOperationException(traceEvent.Message);
+                HandleHostError(exception);
+            }
+        }
+
+        private void HandleHostError(Exception exception)
+        {
+            if (exception == null)
+            {
+                throw new ArgumentNullException("exception");
             }
 
-            errors.Add(error);
+            // First, ensure that we've logged to the host log
+            // Also ensure we flush immediately to ensure any buffered logs
+            // are written
+            TraceWriter.Error("A ScriptHost error has occurred", exception);
+            TraceWriter.Flush();
+
+            if (exception is FunctionInvocationException)
+            {
+                // For all function invocation errors, we notify the invoker so it can
+                // log the error as needed to its function specific logs.
+                FunctionInvocationException invocationException = exception as FunctionInvocationException;
+                NotifyInvoker(invocationException.MethodName, invocationException);
+            }
+            else if (exception is FunctionIndexingException)
+            {
+                // For all startup time indexing errors, we accumulate them per function
+                FunctionIndexingException indexingException = exception as FunctionIndexingException;
+                string formattedError = Utility.FlattenException(indexingException);
+                AddFunctionError(indexingException.MethodName, formattedError);
+
+                // Also notify the invoker so the error can also be written to the function
+                // log file
+                NotifyInvoker(indexingException.MethodName, indexingException);
+
+                // Mark the error as handled so indexing will continue
+                indexingException.Handled = true;
+            }
+            else
+            {
+                // See if we can identify which function caused the error, and if we can
+                // log the error as needed to its function specific logs.
+                FunctionDescriptor function = null;
+                if (TryGetFunctionFromException(Functions, exception, out function))
+                {
+                    NotifyInvoker(function.Name, exception);
+                }
+            }
+        }
+
+        internal static bool TryGetFunctionFromException(Collection<FunctionDescriptor> functions, Exception exception, out FunctionDescriptor function)
+        {
+            function = null;
+
+            string errorStack = exception.ToString().ToLowerInvariant();
+            foreach (var currFunction in functions)
+            {
+                // For each function, we search the entire error stack trace to see if it contains
+                // the function entry/primary script path. If it does, we're virtually certain that
+                // that function caused the error (e.g. as in the case of global unhandled exceptions
+                // coming from Node.js scripts).
+                // We use the directory name for the script rather than the full script path itself to ensure
+                // that we handle cases where the error might be coming from some other script (e.g. an NPM
+                // module) that is part of the function.
+                string absoluteScriptPath = Path.GetFullPath(currFunction.Metadata.ScriptFile).ToLowerInvariant();
+                string functionDirectory = Path.GetDirectoryName(absoluteScriptPath);
+                if (errorStack.Contains(functionDirectory))
+                {
+                    function = currFunction;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void NotifyInvoker(string functionName, Exception ex)
+        {
+            functionName = Utility.GetFunctionShortName(functionName);
+
+            FunctionDescriptor functionDescriptor = this.Functions.SingleOrDefault(p => string.Compare(functionName, p.Name, StringComparison.OrdinalIgnoreCase) == 0);
+            if (functionDescriptor != null)
+            {
+                functionDescriptor.Invoker.OnError(ex);
+            }
         }
 
         private void OnFileChanged(object sender, FileSystemEventArgs e)
         {
             string fileName = Path.GetFileName(e.Name);
 
-            if (((string.Compare(fileName, HostConfigFileName, StringComparison.OrdinalIgnoreCase) == 0) || string.Compare(fileName, FunctionConfigFileName, StringComparison.OrdinalIgnoreCase) == 0) ||
+            if (((string.Compare(fileName, ScriptConstants.HostMetadataFileName, StringComparison.OrdinalIgnoreCase) == 0) ||
+                string.Compare(fileName, ScriptConstants.FunctionMetadataFileName, StringComparison.OrdinalIgnoreCase) == 0) ||
                 (Directory.EnumerateDirectories(ScriptConfig.RootScriptPath).Count() != _directoryCountSnapshot))
             {
                 // a host level configuration change has been made which requires a
@@ -652,6 +851,8 @@ namespace Microsoft.Azure.WebJobs.Script
                 {
                     ((IDisposable)TraceWriter).Dispose();
                 }
+
+                NodeFunctionInvoker.UnhandledException -= OnUnhandledException;
             }
         }
     }

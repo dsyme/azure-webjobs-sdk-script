@@ -4,201 +4,174 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Reflection;
+using System.Net.Http;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Host.Bindings.Runtime;
 using Microsoft.Azure.WebJobs.Script.Binding;
-using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
-    public abstract class ScriptFunctionInvokerBase : IFunctionInvoker, IDisposable
+    [CLSCompliant(false)]
+    public class ScriptFunctionInvokerBase : FunctionInvokerBase
     {
-        private FileSystemWatcher _fileWatcher;
-        private bool _disposed = false;
-
-        internal ScriptFunctionInvokerBase(ScriptHost host, FunctionMetadata functionMetadata)
+        public ScriptFunctionInvokerBase(ScriptHost host, FunctionMetadata functionMetadata) : base(host, functionMetadata)
         {
-            Host = host;
-            Metadata = functionMetadata;
-            TraceWriter = CreateTraceWriter(host.ScriptConfig, functionMetadata.Name);
         }
 
-        public ScriptHost Host { get; private set; }
-
-        public FunctionMetadata Metadata { get; private set; }
-
-        public TraceWriter TraceWriter { get; private set; }
-
-        private static TraceWriter CreateTraceWriter(ScriptHostConfiguration scriptConfig, string functionName)
+        public override Task Invoke(object[] parameters)
         {
-            if (scriptConfig.FileLoggingEnabled)
+            throw new System.NotImplementedException();
+        }
+
+        protected virtual async Task ProcessInputBindingsAsync(object input, string functionInstanceOutputPath, Binder binder,
+            Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings,
+            Dictionary<string, object> bindingData, Dictionary<string, string> environmentVariables)
+        {
+            // if there are any input or output bindings declared, set up the temporary
+            // output directory
+            if (outputBindings.Count > 0 || inputBindings.Any())
             {
-                string logFilePath = Path.Combine(scriptConfig.RootLogPath, "Function", functionName);
-                return new FileTraceWriter(logFilePath, TraceLevel.Verbose);
+                Directory.CreateDirectory(functionInstanceOutputPath);
             }
 
-            return NullTraceWriter.Instance;
-        }
-
-        protected void InitializeFileWatcherIfEnabled()
-        {
-            if (Host.ScriptConfig.FileWatchingEnabled)
+            // process input bindings
+            foreach (var inputBinding in inputBindings)
             {
-                string functionDirectory = Path.GetDirectoryName(Metadata.Source);
-                _fileWatcher = new FileSystemWatcher(functionDirectory, "*.*")
+                string filePath = Path.Combine(functionInstanceOutputPath, inputBinding.Metadata.Name);
+                using (FileStream stream = File.OpenWrite(filePath))
                 {
-                    IncludeSubdirectories = true,
-                    EnableRaisingEvents = true
-                };
-                _fileWatcher.Changed += OnScriptFileChanged;
-                _fileWatcher.Created += OnScriptFileChanged;
-                _fileWatcher.Deleted += OnScriptFileChanged;
-                _fileWatcher.Renamed += OnScriptFileChanged;
-            }
-        }
-
-        public abstract Task Invoke(object[] parameters);
-
-        protected virtual void OnScriptFileChanged(object sender, FileSystemEventArgs e)
-        {
-        }
-
-        protected static Dictionary<string, string> GetBindingData(object value, IBinder binder, Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings)
-        {
-            Dictionary<string, string> bindingData = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-            // If there are any parameters in the bindings,
-            // get the binding data. In dynamic script cases we need
-            // to parse this POCO data ourselves - it won't be in the existing
-            // binding data because all the POCO binders require strong
-            // typing
-            if (outputBindings.Any(p => p.HasBindingParameters) ||
-                inputBindings.Any(p => p.HasBindingParameters))
-            {
-                // First apply any existing binding data. Any additional binding
-                // data coming from the message will take precedence
-                ApplyAmbientBindingData(binder, bindingData);
-
-                try
-                {
-                    // if the input value is a JSON string, extract additional
-                    // binding data from it
-                    string json = value as string;
-                    if (!string.IsNullOrEmpty(json) && IsJson(json))
+                    // If this is the trigger input, write it directly to the stream.
+                    // The trigger binding is a special case because it is early bound
+                    // rather than late bound as is the case with all the other input
+                    // bindings.
+                    if (inputBinding.Metadata.IsTrigger)
                     {
-                        // parse the object skipping any nested objects (binding data
-                        // only includes top level properties)
-                        JObject parsed = JObject.Parse(json);
-                        var additionalBindingData = parsed.Children<JProperty>()
-                            .Where(p => p.Value.Type != JTokenType.Object)
-                            .ToDictionary(p => p.Name, p => (string)p);
-
-                        if (additionalBindingData != null)
+                        if (input is string)
                         {
-                            foreach (var item in additionalBindingData)
+                            using (StreamWriter sw = new StreamWriter(stream))
                             {
-                                if (item.Value != null)
-                                {
-                                    bindingData[item.Key] = item.Value.ToString();
-                                }
+                                await sw.WriteAsync((string)input);
                             }
                         }
+                        else if (input is byte[])
+                        {
+                            byte[] bytes = input as byte[];
+                            await stream.WriteAsync(bytes, 0, bytes.Length);
+                        }
+                        else if (input is Stream)
+                        {
+                            Stream inputStream = input as Stream;
+                            await inputStream.CopyToAsync(stream);
+                        }
                     }
-                }
-                catch
-                {
-                    // it's not an error if the incoming message isn't JSON
-                    // there are cases where there will be output binding parameters
-                    // that don't bind to JSON properties
-                }
-            }
-
-            return bindingData;
-        }
-
-        /// <summary>
-        /// We need to merge the ambient binding data that already exists in the IBinder
-        /// with our binding data. We have to do this rather than relying solely on
-        /// IBinder.BindAsync because we need to include any POCO values we get from parsing
-        /// JSON bodies, etc.
-        /// TEMP: We might find a better way to do this in the future, perhaps via core
-        /// SDK changes.
-        /// </summary>
-        protected static void ApplyAmbientBindingData(IBinder binder, IDictionary<string, string> bindingData)
-        {
-            var ambientBindingData = GetAmbientBindingData(binder);
-            if (ambientBindingData != null)
-            {
-                // apply the binding data to ours
-                foreach (var item in ambientBindingData)
-                {
-                    if (item.Value != null)
+                    else
                     {
-                        bindingData[item.Key] = item.Value.ToString();
+                        // invoke the input binding
+                        BindingContext bindingContext = new BindingContext
+                        {
+                            Binder = binder,
+                            BindingData = bindingData,
+                            DataType = DataType.Stream, 
+                            Value = stream
+                        };
+                        await inputBinding.BindAsync(bindingContext);
                     }
                 }
+
+                environmentVariables[inputBinding.Metadata.Name] = Path.Combine(functionInstanceOutputPath,
+                    inputBinding.Metadata.Name);
             }
         }
 
-        private static IDictionary<string, object> GetAmbientBindingData(IBinder binder)
+        protected virtual async Task ProcessOutputBindingsAsync(string functionInstanceOutputPath, Collection<FunctionBinding> outputBindings,
+            object input, Binder binder, Dictionary<string, object> bindingData)
         {
-            IDictionary<string, object> ambientBindingData = null;
+            if (outputBindings == null)
+            {
+                return;
+            }
 
             try
             {
-                // TEMP HACK: Dig the ambient binding data out of the binder
-                FieldInfo fieldInfo = binder.GetType().GetField("_bindingSource", BindingFlags.NonPublic | BindingFlags.Instance);
-                var bindingSource = fieldInfo.GetValue(binder);
-                PropertyInfo propertyInfo = bindingSource.GetType().GetProperty("AmbientBindingContext");
-                var ambientBindingContext = propertyInfo.GetValue(bindingSource);
-                propertyInfo = ambientBindingContext.GetType().GetProperty("BindingData");
-                ambientBindingData = (IDictionary<string, object>)propertyInfo.GetValue(ambientBindingContext);
-            }
-            catch
-            {
-                // If this fails for whatever reason we just won't
-                // have any binding data
-            }
-
-            return ambientBindingData;
-        }
-
-        protected static bool IsJson(string input)
-        {
-            input = input.Trim();
-            return (input.StartsWith("{", StringComparison.OrdinalIgnoreCase) && input.EndsWith("}", StringComparison.OrdinalIgnoreCase))
-                || (input.StartsWith("[", StringComparison.OrdinalIgnoreCase) && input.EndsWith("]", StringComparison.OrdinalIgnoreCase));
-        }
-
-        protected virtual void Dispose(bool disposing)
-        {
-            if (!_disposed)
-            {
-                if (disposing)
+                foreach (var outputBinding in outputBindings)
                 {
-                    if (_fileWatcher != null)
+                    string filePath = System.IO.Path.Combine(functionInstanceOutputPath, outputBinding.Metadata.Name);
+                    if (File.Exists(filePath))
                     {
-                        _fileWatcher.Dispose();
-                    }
-
-                    if (TraceWriter != null && TraceWriter is IDisposable)
-                    {
-                        ((IDisposable)TraceWriter).Dispose();
+                        using (FileStream stream = File.OpenRead(filePath))
+                        {
+                            BindingContext bindingContext = new BindingContext
+                            {
+                                TriggerValue = input,
+                                Binder = binder,
+                                BindingData = bindingData,
+                                Value = stream
+                            };
+                            await outputBinding.BindAsync(bindingContext);
+                        }
                     }
                 }
-
-                _disposed = true;
+            }
+            finally
+            {
+                // clean up the output directory
+                if (outputBindings.Any() && Directory.Exists(functionInstanceOutputPath))
+                {
+                    Directory.Delete(functionInstanceOutputPath, recursive: true);
+                }
             }
         }
 
-        public void Dispose()
+        protected static object ConvertInput(object input)
         {
-            Dispose(true);
-            GC.SuppressFinalize(this);
+            if (input != null)
+            {
+                // perform any required input conversions
+                HttpRequestMessage request = input as HttpRequestMessage;
+                if (request != null)
+                {
+                    // TODO: Handle other content types? (E.g. byte[])
+                    if (request.Content != null && request.Content.Headers.ContentLength > 0)
+                    {
+                        return ((HttpRequestMessage)input).Content.ReadAsStringAsync().Result;
+                    }
+                }
+            }
+
+            return input;
+        }
+
+        protected virtual void InitializeEnvironmentVariables(Dictionary<string, string> environmentVariables, string functionInstanceOutputPath, object input, Collection<FunctionBinding> outputBindings, ExecutionContext executionContext)
+        {
+            environmentVariables["InvocationId"] = executionContext.InvocationId.ToString();
+
+            foreach (var outputBinding in outputBindings)
+            {
+                environmentVariables[outputBinding.Metadata.Name] = Path.Combine(functionInstanceOutputPath, outputBinding.Metadata.Name);
+            }
+
+            Type triggerParameterType = input.GetType();
+            if (triggerParameterType == typeof(HttpRequestMessage))
+            {
+                HttpRequestMessage request = (HttpRequestMessage)input;
+                environmentVariables["REQ_METHOD"] = request.Method.ToString();
+
+                Dictionary<string, string> queryParams = request.GetQueryNameValuePairs().ToDictionary(p => p.Key, p => p.Value, StringComparer.OrdinalIgnoreCase);
+                foreach (var queryParam in queryParams)
+                {
+                    string varName = string.Format(CultureInfo.InvariantCulture, "REQ_QUERY_{0}", queryParam.Key.ToUpperInvariant());
+                    environmentVariables[varName] = queryParam.Value;
+                }
+
+                foreach (var header in request.Headers)
+                {
+                    string varName = string.Format(CultureInfo.InvariantCulture, "REQ_HEADERS_{0}", header.Key.ToUpperInvariant());
+                    environmentVariables[varName] = header.Value.First();
+                }
+            }
         }
     }
 }

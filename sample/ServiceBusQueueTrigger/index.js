@@ -1,17 +1,17 @@
-﻿module.exports = function (context, message) {
-    context.log("Node.js ServiceBus queue trigger function processed message '" + JSON.stringify(message) + "'");
+﻿var util = require('util');
 
-    var result = null;
-    if (message.count < 1)
+module.exports = function (context, inMessage) {
+    context.log('Node.js ServiceBus queue trigger function processed message', inMessage);
+
+    if (inMessage.count < inMessage.max)
     {
-        // write a message back to the queue that this function is triggered on
-        // ensuring that we only loop on this once
-        message.count += 1;
-        result = {
-            message: JSON.stringify(message)
-        };
+        // write a message back to the queue that this function is triggered
+        inMessage.count += 1;
+        context.bindings.outMessage = inMessage;
     }
-    context.bindings.output = result;
+    else {
+        context.bindings.blob = util.format('%d messages processed', inMessage.count);
+    }
 
     context.done();
 }

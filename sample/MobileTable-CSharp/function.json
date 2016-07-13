@@ -1,0 +1,15 @@
+﻿{
+    "bindings": [
+        {
+            "type": "queueTrigger",
+            "name": "input",
+            "direction": "in",
+            "queueName": "samples-mobiletables-csharp"
+        },
+        {
+            "type": "mobileTable",
+            "name": "newItem",
+            "direction": "out"
+        }
+    ]
+}

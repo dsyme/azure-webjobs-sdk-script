@@ -1,15 +1,16 @@
 ﻿{
-  "bindings": [
-    {
-      "type": "manualTrigger",
-      "direction": "in"
-    },
-    {
-      "type": "eventHub",
-      "name": "output",
-      "direction": "out",
-      "connectionString": "%AzureWebJobsEventHubSender%",
-      "path": "%AzureWebJobsEventHubPath%"
-    }
-  ]
+    "bindings": [
+        {
+            "type": "manualTrigger",
+            "name": "input",
+            "direction": "in"
+        },
+        {
+            "type": "eventHub",
+            "name": "output",
+            "direction": "out",
+            "connection": "AzureWebJobsEventHubSender",
+            "path": "%AzureWebJobsEventHubPath%"
+        }
+    ]
 }
